@@ -10,6 +10,7 @@ export interface Student {
   id: string;
   name: string;
   className: string;
+  classLetter: string; // The letter ID (A, B, C...) for filtering
   priorities: number[]; // Array of Activity IDs
   assignedActivityId: number | null;
 }

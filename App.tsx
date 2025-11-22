@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   Users, 
   Calendar, 
@@ -13,43 +13,77 @@ import {
   LayoutDashboard,
   HelpCircle,
   Lock,
-  Printer
+  Printer,
+  Filter,
+  UserPlus,
+  GripVertical
 } from 'lucide-react';
 import { Activity, ClassGroup, Student, AppState } from './types';
 import { ActivityCard } from './components/ActivityCard';
 import { generatePDF, generateOverviewPDF } from './components/PdfExport';
 
 // --- Helpers ---
-const parseCSV = (text: string, existingClasses: ClassGroup[]): Student[] => {
+const parseCSV = (
+  text: string, 
+  existingClasses: ClassGroup[], 
+  forcedClassId?: string
+): Student[] => {
   const lines = text.split(/\r?\n/);
   const students: Student[] = [];
   
   lines.forEach((line) => {
     if (!line.trim()) return;
     
-    // Handles "Name, ClassLetter, P1, P2, P3"
-    // Example: "Marco, A, 5, 2, 1"
     const parts = line.split(/[,;]/).map(p => p.trim());
     
-    if (parts.length < 3) return; // Need at least Name, Class, 1 Prio
+    let name = '';
+    let className = '';
+    let classLetter = '';
+    let priorities: number[] = [];
 
-    const name = parts[0];
-    const classLetter = parts[1].toUpperCase(); // Normalize to uppercase 'A', 'B'
-    
-    // Find the full class name based on the letter
-    const matchedClass = existingClasses.find(c => c.letter === classLetter);
-    const className = matchedClass ? matchedClass.name : `${classLetter} (Unbekannt)`;
+    // Mode 1: Single Class Import (forcedClassId is present)
+    // Format: Name, Prio1, Prio2...
+    if (forcedClassId) {
+        const matchedClass = existingClasses.find(c => c.id === forcedClassId);
+        if (!matchedClass) return;
 
-    // Parse remaining parts as priorities
-    const priorities = parts.slice(2)
-      .map(p => parseInt(p, 10))
-      .filter(p => !isNaN(p)); // Filter out bad numbers
+        name = parts[0];
+        classLetter = matchedClass.letter;
+        className = matchedClass.name;
+        
+        // All remaining parts are priorities
+        priorities = parts.slice(1)
+          .map(p => parseInt(p, 10))
+          .filter(p => !isNaN(p));
+
+    } else {
+        // Mode 2: Bulk Import
+        // Format: Name, ClassLetter, Prio1, Prio2...
+        if (parts.length < 3) return; 
+
+        name = parts[0];
+        const letterInput = parts[1].toUpperCase();
+        
+        const matchedClass = existingClasses.find(c => c.letter === letterInput);
+        if (matchedClass) {
+            className = matchedClass.name;
+            classLetter = matchedClass.letter;
+        } else {
+            className = `${letterInput} (Unbekannt)`;
+            classLetter = letterInput;
+        }
+
+        priorities = parts.slice(2)
+          .map(p => parseInt(p, 10))
+          .filter(p => !isNaN(p));
+    }
 
     if (name) {
       students.push({
         id: crypto.randomUUID(),
         name,
         className,
+        classLetter,
         priorities,
         assignedActivityId: null
       });
@@ -75,8 +109,27 @@ export default function App() {
   
   // Forms & Inputs
   const [newClassInput, setNewClassInput] = useState('');
+  
+  // Import State
+  const [importMode, setImportMode] = useState<'bulk' | 'single'>('single');
+  const [selectedClassIdForImport, setSelectedClassIdForImport] = useState<string>('');
   const [studentCsvInput, setStudentCsvInput] = useState('');
   
+  // Allocation State
+  // Initialize with all available class letters when classes change
+  const [activeClassLetters, setActiveClassLetters] = useState<string[]>([]);
+  
+  // Drag and Drop State
+  const [draggedStudentId, setDraggedStudentId] = useState<string | null>(null);
+
+  useEffect(() => {
+    // When classes update, ensure new classes are selected by default if the list was empty
+    // or just keep user selection. To simplify: we default to selecting all on first load.
+    if (activeClassLetters.length === 0 && classes.length > 0) {
+      setActiveClassLetters(classes.map(c => c.letter));
+    }
+  }, [classes.length]);
+
   // Manual Activity Form
   const [manualActivity, setManualActivity] = useState({
     name: '', leader: '', max: 20, desc: ''
@@ -103,23 +156,36 @@ export default function App() {
         return char;
       }
     }
-    return "?"; // Fallback if > 26 classes
+    return "?";
   };
 
   const addClass = () => {
     if (!newClassInput.trim()) return;
     
     const letter = getNextClassLetter(classes);
-
-    setClasses([...classes, { 
+    const newClass = { 
       id: crypto.randomUUID(), 
       name: newClassInput.trim(),
       letter: letter
-    }]);
+    };
+
+    setClasses([...classes, newClass]);
+    // Add to active mixing list automatically
+    setActiveClassLetters(prev => [...prev, letter]);
+    
     setNewClassInput('');
+    
+    // If using single import and nothing selected, select this one
+    if (!selectedClassIdForImport) {
+        setSelectedClassIdForImport(newClass.id);
+    }
   };
   
   const removeClass = (id: string) => {
+    const cls = classes.find(c => c.id === id);
+    if (cls) {
+        setActiveClassLetters(prev => prev.filter(l => l !== cls.letter));
+    }
     setClasses(classes.filter(c => c.id !== id));
   };
 
@@ -148,13 +214,55 @@ export default function App() {
       return;
     }
 
-    const parsed = parseCSV(studentCsvInput, classes);
+    if (importMode === 'single' && !selectedClassIdForImport) {
+      alert("Bitte wählen Sie eine Klasse aus.");
+      return;
+    }
+
+    const forcedClass = importMode === 'single' ? selectedClassIdForImport : undefined;
+    const parsed = parseCSV(studentCsvInput, classes, forcedClass);
+    
     if (parsed.length === 0) {
       alert("Keine gültigen Schülerdaten gefunden. Bitte Format prüfen.");
       return;
     }
-    setStudents(parsed);
-    alert(`${parsed.length} Schüler erfolgreich importiert!`);
+
+    // Append logic: Add new students to existing list
+    // Optionally: remove existing students from that class if re-importing?
+    // For now, we just append. User can delete all if needed.
+    setStudents(prev => [...prev, ...parsed]);
+    setStudentCsvInput(''); // Clear input for next batch
+    alert(`${parsed.length} Schüler erfolgreich hinzugefügt!`);
+  };
+
+  const clearAllStudents = () => {
+    if (confirm("Möchten Sie wirklich alle Schülerdaten löschen?")) {
+      setStudents([]);
+    }
+  };
+
+  // --- Drag and Drop Handlers ---
+  const handleDragStart = (e: React.DragEvent, studentId: string) => {
+    e.dataTransfer.setData('studentId', studentId);
+    e.dataTransfer.effectAllowed = 'move';
+    setDraggedStudentId(studentId);
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault(); // Necessary to allow dropping
+    e.dataTransfer.dropEffect = 'move';
+  };
+
+  const handleDrop = (e: React.DragEvent, targetActivityId: number | null) => {
+    e.preventDefault();
+    const studentId = e.dataTransfer.getData('studentId');
+    
+    if (studentId) {
+      setStudents(prev => prev.map(s => 
+        s.id === studentId ? { ...s, assignedActivityId: targetActivityId } : s
+      ));
+    }
+    setDraggedStudentId(null);
   };
 
   // --- Algorithm: Allocation ---
@@ -164,38 +272,54 @@ export default function App() {
         return;
     }
 
-    // 1. Reset all assignments
-    let workingStudents = students.map(s => ({ ...s, assignedActivityId: null }));
+    if (activeClassLetters.length === 0) {
+        alert("Bitte wählen Sie mindestens eine Klasse in der Misch-Konfiguration aus.");
+        return;
+    }
+
+    // 1. Separate students into "Active" (to be processed) and "Inactive" (keep existing assignment)
+    const activeStudents = students.filter(s => activeClassLetters.includes(s.classLetter));
+    const inactiveStudents = students.filter(s => !activeClassLetters.includes(s.classLetter));
+
+    if (activeStudents.length === 0) {
+        alert("Keine Schüler in den ausgewählten Klassen gefunden.");
+        return;
+    }
+
+    // 2. Initialize counts based on INACTIVE students who are already assigned
+    // This respects capacity taken by classes not currently being mixed
     const activityCounts: Record<number, number> = {};
     activities.forEach(a => activityCounts[a.id] = 0);
+    
+    inactiveStudents.forEach(s => {
+        if (s.assignedActivityId !== null) {
+            if (activityCounts[s.assignedActivityId] !== undefined) {
+                activityCounts[s.assignedActivityId]++;
+            }
+        }
+    });
 
-    // 2. Shuffle (Fisher-Yates) to ensure fairness for same-priority conflicts.
-    // This ensures that "Aaron" doesn't always get priority over "Zoe" just because of the name.
+    // 3. Reset assignments for ACTIVE students only
+    let workingStudents = activeStudents.map(s => ({ ...s, assignedActivityId: null }));
+
+    // 4. Shuffle (Fisher-Yates)
     for (let i = workingStudents.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [workingStudents[i], workingStudents[j]] = [workingStudents[j], workingStudents[i]];
     }
 
-    // 3. Iterate priorities (Priority 1 -> Priority N)
-    // The requirement is: "Try to fulfill priority 1, if not possible, then priority 2..."
-    // This loop structure guarantees exactly that. We process ALL Priority 1 wishes first.
+    // 5. Iterate priorities
     const maxPrioDepth = Math.max(...workingStudents.map(s => s.priorities.length), 0);
 
     for (let pIndex = 0; pIndex < maxPrioDepth; pIndex++) {
       workingStudents.forEach(student => {
-        // If already assigned in a previous (higher) priority round, skip
         if (student.assignedActivityId !== null) return;
 
-        // Get the activity ID at this priority level (0 = 1st choice, 1 = 2nd choice...)
         const wantedActivityId = student.priorities[pIndex];
-        
-        // Check if this activity exists in our list
         const activity = activities.find(a => a.id === wantedActivityId);
         
-        // Skip if ID is invalid or not found
         if (!activity) return; 
 
-        // Check capacity
         if (activityCounts[wantedActivityId] < activity.maxParticipants) {
           student.assignedActivityId = wantedActivityId;
           activityCounts[wantedActivityId]++;
@@ -203,10 +327,13 @@ export default function App() {
       });
     }
 
-    // 4. Update State
-    // Sort back by Name for display
-    workingStudents.sort((a, b) => a.name.localeCompare(b.name));
-    setStudents(workingStudents);
+    // 6. Merge results
+    // Combine the newly processed students with the untouched inactive students
+    const allStudents = [...inactiveStudents, ...workingStudents];
+    
+    // Sort by Name for display
+    allStudents.sort((a, b) => a.name.localeCompare(b.name));
+    setStudents(allStudents);
   };
 
   // --- Render Helpers ---
@@ -305,7 +432,7 @@ export default function App() {
         </nav>
 
         <div className="p-4 border-t border-slate-700 text-xs text-slate-500">
-          v1.0.4
+          v1.1.0 (DnD)
         </div>
       </aside>
 
@@ -338,8 +465,7 @@ export default function App() {
               <div className="bg-blue-50 border border-blue-100 p-4 rounded-lg mb-6 text-sm text-blue-800 flex items-start gap-3">
                  <HelpCircle className="flex-shrink-0 mt-0.5" size={18} />
                  <div>
-                   <p>Erstellen Sie hier Ihre Schulklassen. Jede Klasse erhält automatisch einen <strong>Buchstaben (A, B, C...)</strong>.</p>
-                   <p className="mt-1">Diesen Buchstaben benötigen Sie später beim Import der Schülerdaten, um die Schüler der korrekten Klasse zuzuordnen.</p>
+                   <p>Erstellen Sie hier Ihre Schulklassen. Jede Klasse erhält automatisch einen <strong>Buchstaben (A, B, C...)</strong> für die interne Verwaltung.</p>
                  </div>
               </div>
 
@@ -460,56 +586,92 @@ export default function App() {
               <h2 className="text-2xl font-bold text-slate-800 mb-4 flex items-center gap-2">
                 <FileSpreadsheet className="text-blue-600" /> Schülerdaten importieren
               </h2>
-              
-              <div className="mb-6 bg-blue-50 p-4 rounded-lg border border-blue-100 text-sm text-blue-800">
-                <p className="font-bold mb-2">Erforderliches Format:</p>
-                <code className="bg-white px-2 py-1 rounded border border-blue-200 block mb-4 font-mono text-xs md:text-sm">
-                  Name, Klassen-Buchstabe, Prio1, Prio2, Prio3...
-                </code>
-                
-                <div className="mb-4">
-                  <h4 className="font-bold mb-1">Ihre Klassen-Codes:</h4>
-                  {classes.length === 0 ? (
-                    <p className="text-red-500 italic">Noch keine Klassen angelegt.</p>
-                  ) : (
-                    <div className="flex flex-wrap gap-2">
-                      {classes.map(c => (
-                        <span key={c.id} className="bg-white border border-blue-200 px-2 py-1 rounded text-xs flex items-center gap-1 shadow-sm">
-                          <span className="font-bold bg-blue-600 text-white w-5 h-5 flex items-center justify-center rounded text-[10px]">{c.letter}</span>
-                          <span>{c.name}</span>
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
 
-                <p className="mt-2 text-xs">
-                  <span className="font-semibold">Beispiel:</span><br/>
-                  Marco, A, 5, 4, 3, 2, 1<br/>
-                  (Marco geht in die Klasse A und wünscht sich Aktivität 5 am meisten.)
-                </p>
+              {/* Import Mode Switch */}
+              <div className="flex gap-4 mb-6">
+                 <button 
+                   onClick={() => setImportMode('single')}
+                   className={`flex-1 py-3 px-4 rounded-lg border-2 text-sm font-medium transition-all ${importMode === 'single' ? 'border-blue-600 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-500 hover:border-slate-300'}`}
+                 >
+                   1. Einzelne Klasse (Empfohlen)
+                 </button>
+                 <button 
+                   onClick={() => setImportMode('bulk')}
+                   className={`flex-1 py-3 px-4 rounded-lg border-2 text-sm font-medium transition-all ${importMode === 'bulk' ? 'border-blue-600 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-500 hover:border-slate-300'}`}
+                 >
+                   2. Alle (CSV mit Klassenbuchstabe)
+                 </button>
               </div>
+
+              {importMode === 'single' ? (
+                /* Single Class Mode */
+                <div className="mb-6 space-y-4">
+                    <div>
+                        <label className="block text-sm font-medium text-slate-700 mb-1">Ziel-Klasse auswählen:</label>
+                        <select 
+                            value={selectedClassIdForImport}
+                            onChange={(e) => setSelectedClassIdForImport(e.target.value)}
+                            className="w-full border border-slate-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-blue-500 outline-none bg-white"
+                        >
+                            <option value="">-- Bitte Klasse wählen --</option>
+                            {classes.map(c => (
+                                <option key={c.id} value={c.id}>{c.name} ({c.letter})</option>
+                            ))}
+                        </select>
+                    </div>
+                    <div className="bg-blue-50 p-4 rounded-lg border border-blue-100 text-sm text-blue-800">
+                        <p className="font-bold mb-1">Format:</p>
+                        <code className="bg-white px-2 py-1 rounded border border-blue-200 block mb-2 font-mono text-xs md:text-sm">
+                        Name, Prio1, Prio2, Prio3...
+                        </code>
+                        <p className="text-xs">Beispiel: <code>Marco, 5, 4, 3, 1</code></p>
+                    </div>
+                </div>
+              ) : (
+                /* Bulk Mode */
+                 <div className="mb-6 bg-blue-50 p-4 rounded-lg border border-blue-100 text-sm text-blue-800">
+                    <p className="font-bold mb-1">Format:</p>
+                    <code className="bg-white px-2 py-1 rounded border border-blue-200 block mb-2 font-mono text-xs md:text-sm">
+                    Name, Klassen-Buchstabe, Prio1, Prio2...
+                    </code>
+                    <div className="flex flex-wrap gap-2 mt-2">
+                        {classes.map(c => (
+                        <span key={c.id} className="bg-white border border-blue-200 px-2 py-1 rounded text-xs font-bold">
+                            {c.letter}: {c.name}
+                        </span>
+                        ))}
+                    </div>
+                </div>
+              )}
 
               <textarea
                 className="w-full h-64 p-4 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none font-mono text-sm"
-                placeholder={`Marco, A, 1, 5, 2\nLisa, A, 2, 1, 3\nTom, B, 5, 3, 1`}
+                placeholder={importMode === 'single' ? "Marco, 5, 2, 1\nLisa, 2, 1, 3" : "Marco, A, 5, 2, 1\nTom, B, 5, 3, 1"}
                 value={studentCsvInput}
                 onChange={(e) => setStudentCsvInput(e.target.value)}
               />
 
-              <div className="mt-4 flex justify-end">
+              <div className="mt-4 flex justify-between items-center">
+                <button 
+                  onClick={clearAllStudents}
+                  className="text-red-400 hover:text-red-600 text-sm flex items-center gap-1"
+                >
+                  <Trash2 size={16} /> Liste leeren
+                </button>
+
                 <button 
                   onClick={handleImportStudents}
                   className="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700 font-medium flex items-center gap-2 shadow-sm transition-transform active:scale-95"
                 >
-                  <CheckCircle2 size={20} /> Daten verarbeiten
+                  <UserPlus size={20} /> 
+                  SuS zur Liste hinzufügen
                 </button>
               </div>
             </div>
 
             {students.length > 0 && (
               <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-                <h3 className="font-bold text-lg mb-4">Vorschau ({students.length} SuS)</h3>
+                <h3 className="font-bold text-lg mb-4">Gesamtliste ({students.length} SuS)</h3>
                 <div className="overflow-x-auto">
                   <table className="w-full text-left text-sm text-slate-600">
                     <thead className="bg-slate-50 text-slate-900 font-semibold border-b border-slate-200">
@@ -520,15 +682,14 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {students.slice(0, 10).map(s => (
-                        <tr key={s.id} className="border-b border-slate-100 hover:bg-slate-50">
+                      {students.slice(-10).reverse().map(s => (
+                        <tr key={s.id} className="border-b border-slate-100 hover:bg-slate-50 animate-fade-in">
                           <td className="p-3">{s.name}</td>
                           <td className="p-3">{s.className}</td>
                           <td className="p-3">
                             <div className="flex gap-1">
                               {s.priorities.map((p, idx) => (
                                 <span key={idx} className="bg-slate-200 text-slate-700 px-2 py-0.5 rounded text-xs flex items-center gap-1">
-                                  {idx === 0 && <span className="text-[10px] text-slate-500 font-bold">#1</span>}
                                   {p}
                                 </span>
                               ))}
@@ -538,9 +699,7 @@ export default function App() {
                       ))}
                     </tbody>
                   </table>
-                  {students.length > 10 && (
-                    <p className="p-3 text-center text-slate-400 text-xs">... und {students.length - 10} weitere</p>
-                  )}
+                  <p className="text-xs text-slate-400 mt-2 text-center">Zeigt die letzten 10 Importe. Alle Daten gespeichert.</p>
                 </div>
               </div>
             )}
@@ -556,14 +715,9 @@ export default function App() {
                     <CheckCircle2 className="text-green-600" /> Zuteilung & Ergebnis
                   </h2>
                   <p className="text-slate-500 mt-1">Status: {getStats().assigned} von {getStats().total} Schülern zugeteilt.</p>
+                  <p className="text-xs text-blue-500 mt-1 flex items-center gap-1"><GripVertical size={12}/> Drag & Drop aktiviert</p>
                 </div>
                 <div className="flex gap-3">
-                  <button 
-                    onClick={runAllocation}
-                    className="bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 flex items-center gap-2 shadow-sm"
-                  >
-                    <RefreshCw size={18} /> Algorithmus starten
-                  </button>
                   <button 
                     onClick={() => generatePDF(activities, students)}
                     disabled={getStats().assigned === 0}
@@ -574,28 +728,98 @@ export default function App() {
                 </div>
              </div>
 
-             <div className="bg-indigo-50 border border-indigo-100 p-4 rounded-lg text-sm text-indigo-800 mb-6">
-                <strong>Algorithmus-Logik:</strong> Zuerst wird versucht, jedem Kind den 1. Wunsch zu erfüllen. Sind Plätze belegt, wird der 2. Wunsch geprüft, usw.
-                Die Reihenfolge der Schüler wird zufällig gemischt, um Fairness zu gewährleisten.
-             </div>
+            {/* CONFIGURATION SECTION */}
+            <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+                 <div className="flex items-center gap-2 mb-3 pb-2 border-b border-slate-100">
+                    <Filter size={18} className="text-blue-600" />
+                    <h3 className="font-bold text-slate-800">Misch-Konfiguration</h3>
+                 </div>
+                 <p className="text-sm text-slate-500 mb-4">
+                    Wählen Sie, welche Klassen bei diesem Durchlauf gemischt und zugeteilt werden sollen.
+                    <br/>
+                    <span className="text-xs text-slate-400">Hinweis: Bereits zugeteilte Schüler in <strong>nicht</strong> ausgewählten Klassen belegen weiterhin ihre Plätze.</span>
+                 </p>
+                 
+                 <div className="flex flex-wrap gap-3 mb-4">
+                    {classes.map(c => {
+                        const isActive = activeClassLetters.includes(c.letter);
+                        return (
+                            <button
+                                key={c.id}
+                                onClick={() => {
+                                    if (isActive) {
+                                        setActiveClassLetters(prev => prev.filter(l => l !== c.letter));
+                                    } else {
+                                        setActiveClassLetters(prev => [...prev, c.letter]);
+                                    }
+                                }}
+                                className={`px-3 py-2 rounded-lg border text-sm font-medium flex items-center gap-2 transition-colors ${isActive ? 'bg-blue-600 border-blue-600 text-white' : 'bg-white border-slate-200 text-slate-600 hover:border-blue-300'}`}
+                            >
+                                {isActive && <CheckCircle2 size={14} />}
+                                {c.name}
+                            </button>
+                        );
+                    })}
+                    {classes.length === 0 && <span className="text-sm text-slate-400 italic">Keine Klassen vorhanden.</span>}
+                 </div>
 
-             {getStats().unassigned > 0 && getStats().assigned > 0 && (
-               <div className="bg-red-50 border border-red-200 p-4 rounded-lg flex items-start gap-3">
+                  <button 
+                    onClick={runAllocation}
+                    className="w-full md:w-auto bg-green-600 text-white px-6 py-3 rounded-lg hover:bg-green-700 flex items-center justify-center gap-2 shadow-sm transition-all font-bold"
+                  >
+                    <RefreshCw size={18} /> 
+                    Algorithmus für Auswahl starten
+                  </button>
+            </div>
+
+
+            {/* Unassigned Students Drop Zone */}
+             <div 
+               onDragOver={handleDragOver}
+               onDrop={(e) => handleDrop(e, null)}
+               className={`border-2 border-dashed rounded-lg p-4 transition-colors ${draggedStudentId ? 'border-red-300 bg-red-50' : 'border-slate-200 bg-slate-50'}`}
+             >
+               <div className="flex items-start gap-3 mb-2">
                  <AlertCircle className="text-red-500 mt-0.5" />
                  <div>
-                   <h4 className="font-bold text-red-800">Achtung: {getStats().unassigned} Schüler nicht zugeteilt</h4>
-                   <p className="text-sm text-red-700">Diese Schüler konnten keinem ihrer Prioritäten zugeteilt werden, da die Gruppen voll sind. Bitte weisen Sie sie manuell zu oder erhöhen Sie die Kapazitäten.</p>
+                   <h4 className="font-bold text-red-800">Nicht zugeteilt ({getStats().unassigned})</h4>
+                   <p className="text-xs text-red-600">Ziehen Sie Schüler hierher, um sie aus einer Gruppe zu entfernen, oder ziehen Sie sie von hier in eine Gruppe.</p>
                  </div>
                </div>
-             )}
+               
+               {getStats().unassigned > 0 ? (
+                 <div className="flex flex-wrap gap-2 mt-2">
+                   {students.filter(s => s.assignedActivityId === null).map(s => (
+                     <div 
+                       key={s.id}
+                       draggable
+                       onDragStart={(e) => handleDragStart(e, s.id)}
+                       className="bg-white border border-red-200 text-red-800 px-2 py-1 rounded text-sm shadow-sm cursor-move hover:bg-red-50 flex items-center gap-2 active:opacity-50"
+                     >
+                       <GripVertical size={14} className="text-red-300" />
+                       <span>{s.name}</span>
+                       <span className="text-xs text-red-400">({s.className})</span>
+                     </div>
+                   ))}
+                 </div>
+               ) : (
+                 <p className="text-xs text-slate-400 italic mt-2">Alle Schüler sind zugeteilt.</p>
+               )}
+             </div>
 
+             {/* Activity Grid - Drop Zones */}
              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 {activities.map(activity => {
                   const assignedHere = students.filter(s => s.assignedActivityId === activity.id);
                   const isFull = assignedHere.length >= activity.maxParticipants;
                   
                   return (
-                    <div key={activity.id} className={`bg-white rounded-xl border shadow-sm flex flex-col ${isFull ? 'border-orange-200' : 'border-slate-200'}`}>
+                    <div 
+                        key={activity.id} 
+                        onDragOver={handleDragOver}
+                        onDrop={(e) => handleDrop(e, activity.id)}
+                        className={`bg-white rounded-xl border shadow-sm flex flex-col transition-all ${draggedStudentId ? 'ring-2 ring-offset-2 ring-blue-100 cursor-copy' : ''} ${isFull ? 'border-orange-200' : 'border-slate-200'}`}
+                    >
                       <div className={`p-4 border-b ${isFull ? 'bg-orange-50 border-orange-100' : 'bg-slate-50 border-slate-100'} rounded-t-xl flex justify-between items-center`}>
                         <div>
                           <h3 className="font-bold text-slate-800">{activity.name}</h3>
@@ -609,19 +833,30 @@ export default function App() {
                       </div>
                       <div className="p-0 max-h-64 overflow-y-auto">
                         {assignedHere.length === 0 ? (
-                          <div className="p-8 text-center text-slate-400 text-sm italic">Leer</div>
+                          <div className="p-8 text-center text-slate-400 text-sm italic">
+                            Leer - Ziehen Sie Schüler hierher
+                          </div>
                         ) : (
                           <table className="w-full text-sm text-left">
                             <thead className="bg-slate-50 sticky top-0">
                               <tr>
-                                <th className="p-2 pl-4 font-medium text-slate-500">Name</th>
+                                <th className="p-2 pl-4 font-medium text-slate-500 w-8"></th>
+                                <th className="p-2 font-medium text-slate-500">Name</th>
                                 <th className="p-2 font-medium text-slate-500">Klasse</th>
                               </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-100">
                               {assignedHere.map(s => (
-                                <tr key={s.id}>
-                                  <td className="p-2 pl-4 text-slate-700">{s.name}</td>
+                                <tr 
+                                  key={s.id}
+                                  draggable
+                                  onDragStart={(e) => handleDragStart(e, s.id)}
+                                  className="hover:bg-blue-50 cursor-move transition-colors active:opacity-50 group"
+                                >
+                                  <td className="p-2 pl-4 text-slate-300 group-hover:text-blue-400">
+                                    <GripVertical size={14} />
+                                  </td>
+                                  <td className="p-2 text-slate-700 font-medium">{s.name}</td>
                                   <td className="p-2 text-slate-500 text-xs">{s.className}</td>
                                 </tr>
                               ))}
