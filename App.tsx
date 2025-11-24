@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect } from 'react';
 import { 
   Users, 
@@ -13,12 +14,16 @@ import {
   LayoutDashboard,
   HelpCircle,
   Lock,
+  Unlock,
   Printer,
   Filter,
   UserPlus,
-  GripVertical
+  GripVertical,
+  Clock,
+  Sun,
+  MapPin
 } from 'lucide-react';
-import { Activity, ClassGroup, Student, AppState } from './types';
+import { Activity, ClassGroup, Student, AppState, TimeSlot } from './types';
 import { ActivityCard } from './components/ActivityCard';
 import { generatePDF, generateOverviewPDF } from './components/PdfExport';
 
@@ -40,9 +45,19 @@ const parseCSV = (
     let className = '';
     let classLetter = '';
     let priorities: number[] = [];
+    let isMorningOnly = false;
+
+    // Helper to check for trailing X
+    const checkAndRemoveMorningFlag = (arr: string[]) => {
+        if (arr.length > 0 && arr[arr.length - 1].toUpperCase() === 'X') {
+            isMorningOnly = true;
+            return arr.slice(0, -1);
+        }
+        return arr;
+    };
 
     // Mode 1: Single Class Import (forcedClassId is present)
-    // Format: Name, Prio1, Prio2...
+    // Format: Name, Prio1, Prio2..., [X]
     if (forcedClassId) {
         const matchedClass = existingClasses.find(c => c.id === forcedClassId);
         if (!matchedClass) return;
@@ -51,14 +66,16 @@ const parseCSV = (
         classLetter = matchedClass.letter;
         className = matchedClass.name;
         
-        // All remaining parts are priorities
-        priorities = parts.slice(1)
+        let prioParts = parts.slice(1);
+        prioParts = checkAndRemoveMorningFlag(prioParts);
+        
+        priorities = prioParts
           .map(p => parseInt(p, 10))
           .filter(p => !isNaN(p));
 
     } else {
         // Mode 2: Bulk Import
-        // Format: Name, ClassLetter, Prio1, Prio2...
+        // Format: Name, ClassLetter, Prio1, Prio2..., [X]
         if (parts.length < 3) return; 
 
         name = parts[0];
@@ -73,7 +90,10 @@ const parseCSV = (
             classLetter = letterInput;
         }
 
-        priorities = parts.slice(2)
+        let prioParts = parts.slice(2);
+        prioParts = checkAndRemoveMorningFlag(prioParts);
+
+        priorities = prioParts
           .map(p => parseInt(p, 10))
           .filter(p => !isNaN(p));
     }
@@ -85,7 +105,9 @@ const parseCSV = (
         className,
         classLetter,
         priorities,
-        assignedActivityId: null
+        assignedActivityIds: [],
+        isMorningOnly,
+        isLocked: false
       });
     }
   });
@@ -107,6 +129,9 @@ export default function App() {
   const [activities, setActivities] = useState<Activity[]>([]);
   const [students, setStudents] = useState<Student[]>([]);
   
+  // Settings
+  const [assignmentsPerStudent, setAssignmentsPerStudent] = useState<number>(1);
+  
   // Forms & Inputs
   const [newClassInput, setNewClassInput] = useState('');
   
@@ -116,15 +141,12 @@ export default function App() {
   const [studentCsvInput, setStudentCsvInput] = useState('');
   
   // Allocation State
-  // Initialize with all available class letters when classes change
   const [activeClassLetters, setActiveClassLetters] = useState<string[]>([]);
   
   // Drag and Drop State
   const [draggedStudentId, setDraggedStudentId] = useState<string | null>(null);
 
   useEffect(() => {
-    // When classes update, ensure new classes are selected by default if the list was empty
-    // or just keep user selection. To simplify: we default to selecting all on first load.
     if (activeClassLetters.length === 0 && classes.length > 0) {
       setActiveClassLetters(classes.map(c => c.letter));
     }
@@ -132,7 +154,7 @@ export default function App() {
 
   // Manual Activity Form
   const [manualActivity, setManualActivity] = useState({
-    name: '', leader: '', max: 20, desc: ''
+    name: '', leader: '', max: 20, desc: '', location: '', timeSlot: 'G' as TimeSlot
   });
 
   // --- Handlers: Login ---
@@ -170,12 +192,9 @@ export default function App() {
     };
 
     setClasses([...classes, newClass]);
-    // Add to active mixing list automatically
     setActiveClassLetters(prev => [...prev, letter]);
-    
     setNewClassInput('');
     
-    // If using single import and nothing selected, select this one
     if (!selectedClassIdForImport) {
         setSelectedClassIdForImport(newClass.id);
     }
@@ -192,19 +211,44 @@ export default function App() {
   // --- Handlers: Activities ---
   const addManualActivity = () => {
     if (!manualActivity.name || !manualActivity.leader) return;
-    const newId = activities.length > 0 ? Math.max(...activities.map(a => a.id)) + 1 : 1;
+    
+    // Check if activity with same name/leader exists to reuse Public ID
+    const existingMatch = activities.find(
+        a => a.name.toLowerCase() === manualActivity.name.toLowerCase() && 
+             a.leader.toLowerCase() === manualActivity.leader.toLowerCase()
+    );
+
+    let publicId: number;
+    if (existingMatch) {
+        publicId = existingMatch.publicId;
+    } else {
+        // Find max public ID
+        const maxId = activities.length > 0 ? Math.max(...activities.map(a => a.publicId)) : 0;
+        publicId = maxId + 1;
+    }
+
     setActivities([...activities, {
-      id: newId,
+      id: crypto.randomUUID(),
+      publicId,
       name: manualActivity.name,
       leader: manualActivity.leader,
       maxParticipants: manualActivity.max,
-      description: manualActivity.desc
+      description: manualActivity.desc,
+      location: manualActivity.location,
+      timeSlot: manualActivity.timeSlot
     }]);
-    setManualActivity({ name: '', leader: '', max: 20, desc: '' });
+    
+    // Keep common fields, reset optional
+    setManualActivity({ ...manualActivity, desc: '', location: '' });
   };
 
-  const deleteActivity = (id: number) => {
+  const deleteActivity = (id: string) => {
     setActivities(activities.filter(a => a.id !== id));
+    // Remove assignment from students
+    setStudents(prev => prev.map(s => ({
+        ...s,
+        assignedActivityIds: s.assignedActivityIds.filter(aid => aid !== id)
+    })));
   };
 
   // --- Handlers: Students ---
@@ -227,11 +271,8 @@ export default function App() {
       return;
     }
 
-    // Append logic: Add new students to existing list
-    // Optionally: remove existing students from that class if re-importing?
-    // For now, we just append. User can delete all if needed.
     setStudents(prev => [...prev, ...parsed]);
-    setStudentCsvInput(''); // Clear input for next batch
+    setStudentCsvInput('');
     alert(`${parsed.length} Schüler erfolgreich hinzugefügt!`);
   };
 
@@ -239,6 +280,12 @@ export default function App() {
     if (confirm("Möchten Sie wirklich alle Schülerdaten löschen?")) {
       setStudents([]);
     }
+  };
+
+  const toggleStudentLock = (studentId: string) => {
+    setStudents(prev => prev.map(s => 
+        s.id === studentId ? { ...s, isLocked: !s.isLocked } : s
+    ));
   };
 
   // --- Drag and Drop Handlers ---
@@ -249,20 +296,60 @@ export default function App() {
   };
 
   const handleDragOver = (e: React.DragEvent) => {
-    e.preventDefault(); // Necessary to allow dropping
+    e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
   };
 
-  const handleDrop = (e: React.DragEvent, targetActivityId: number | null) => {
+  // Dropping into an Activity
+  const handleDropOnActivity = (e: React.DragEvent, targetActivityId: string) => {
     e.preventDefault();
     const studentId = e.dataTransfer.getData('studentId');
+    const targetActivity = activities.find(a => a.id === targetActivityId);
     
-    if (studentId) {
-      setStudents(prev => prev.map(s => 
-        s.id === studentId ? { ...s, assignedActivityId: targetActivityId } : s
-      ));
+    if (studentId && targetActivity) {
+      setStudents(prev => prev.map(s => {
+        if (s.id !== studentId) return s;
+
+        // Constraint check: Morning Only vs Activity Time
+        if (s.isMorningOnly && targetActivity.timeSlot !== 'V') {
+            alert(`Dieser Schüler ist nur vormittags anwesend und kann nicht zu '${targetActivity.timeSlot === 'G' ? 'Ganztags' : 'Nachmittag'}' zugeteilt werden.`);
+            return s;
+        }
+
+        // Avoid duplicates
+        if (s.assignedActivityIds.includes(targetActivityId)) return s;
+
+        // If trying to add assignment to a locked student via drag, we assume manual override is desired.
+        // We do NOT toggle lock here, but we allow the move.
+
+        return { 
+            ...s, 
+            assignedActivityIds: [...s.assignedActivityIds, targetActivityId] 
+        };
+      }));
     }
     setDraggedStudentId(null);
+  };
+
+  const handleDropOnUnassigned = (e: React.DragEvent) => {
+    e.preventDefault();
+    const studentId = e.dataTransfer.getData('studentId');
+    if (studentId) {
+        if (confirm("Alle Zuteilungen für diesen Schüler entfernen?")) {
+            setStudents(prev => prev.map(s => 
+                s.id === studentId ? { ...s, assignedActivityIds: [] } : s
+            ));
+        }
+    }
+    setDraggedStudentId(null);
+  };
+  
+  const removeAssignment = (studentId: string, activityId: string) => {
+      setStudents(prev => prev.map(s => 
+        s.id === studentId 
+            ? { ...s, assignedActivityIds: s.assignedActivityIds.filter(id => id !== activityId) }
+            : s
+      ));
   };
 
   // --- Algorithm: Allocation ---
@@ -273,65 +360,105 @@ export default function App() {
     }
 
     if (activeClassLetters.length === 0) {
-        alert("Bitte wählen Sie mindestens eine Klasse in der Misch-Konfiguration aus.");
+        alert("Bitte wählen Sie Klassen in der Misch-Konfiguration aus.");
         return;
     }
 
-    // 1. Separate students into "Active" (to be processed) and "Inactive" (keep existing assignment)
+    // 1. Separate Active (Selected Classes) vs Inactive (Unselected)
     const activeStudents = students.filter(s => activeClassLetters.includes(s.classLetter));
     const inactiveStudents = students.filter(s => !activeClassLetters.includes(s.classLetter));
 
     if (activeStudents.length === 0) {
-        alert("Keine Schüler in den ausgewählten Klassen gefunden.");
+        alert("Keine Schüler in den ausgewählten Klassen.");
         return;
     }
 
-    // 2. Initialize counts based on INACTIVE students who are already assigned
-    // This respects capacity taken by classes not currently being mixed
-    const activityCounts: Record<number, number> = {};
+    // 2. Identify Locked vs Unlocked within Active
+    const lockedActiveStudents = activeStudents.filter(s => s.isLocked);
+    const unlockedActiveStudents = activeStudents.filter(s => !s.isLocked);
+
+    // 3. Initialize counts based on INACTIVE students AND LOCKED Active students
+    // These slots are already "taken" and cannot be used by the algorithm
+    const activityCounts: Record<string, number> = {};
     activities.forEach(a => activityCounts[a.id] = 0);
     
+    // Count assignments from inactive students
     inactiveStudents.forEach(s => {
-        if (s.assignedActivityId !== null) {
-            if (activityCounts[s.assignedActivityId] !== undefined) {
-                activityCounts[s.assignedActivityId]++;
+        s.assignedActivityIds.forEach(aid => {
+            if (activityCounts[aid] !== undefined) {
+                activityCounts[aid]++;
             }
-        }
+        });
     });
 
-    // 3. Reset assignments for ACTIVE students only
-    let workingStudents = activeStudents.map(s => ({ ...s, assignedActivityId: null }));
+    // Count assignments from locked active students
+    lockedActiveStudents.forEach(s => {
+        s.assignedActivityIds.forEach(aid => {
+            if (activityCounts[aid] !== undefined) {
+                activityCounts[aid]++;
+            }
+        });
+    });
 
-    // 4. Shuffle (Fisher-Yates)
-    for (let i = workingStudents.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [workingStudents[i], workingStudents[j]] = [workingStudents[j], workingStudents[i]];
-    }
+    // 4. Reset assignments for UNLOCKED active students only
+    let workingStudents = unlockedActiveStudents.map(s => ({ ...s, assignedActivityIds: [] as string[] }));
 
-    // 5. Iterate priorities
-    const maxPrioDepth = Math.max(...workingStudents.map(s => s.priorities.length), 0);
+    // 5. SORTING STRATEGY
+    // CRITICAL: Morning-only students must be processed FIRST to ensure they get Vormittag slots.
+    workingStudents.sort((a, b) => {
+        if (a.isMorningOnly && !b.isMorningOnly) return -1;
+        if (!a.isMorningOnly && b.isMorningOnly) return 1;
+        return 0; 
+    });
 
-    for (let pIndex = 0; pIndex < maxPrioDepth; pIndex++) {
-      workingStudents.forEach(student => {
-        if (student.assignedActivityId !== null) return;
-
-        const wantedActivityId = student.priorities[pIndex];
-        const activity = activities.find(a => a.id === wantedActivityId);
+    // 6. Loop for Number of Assignments needed
+    for (let round = 1; round <= assignmentsPerStudent; round++) {
         
-        if (!activity) return; 
-
-        if (activityCounts[wantedActivityId] < activity.maxParticipants) {
-          student.assignedActivityId = wantedActivityId;
-          activityCounts[wantedActivityId]++;
+        // Fisher-Yates shuffle
+        for (let i = workingStudents.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [workingStudents[i], workingStudents[j]] = [workingStudents[j], workingStudents[i]];
         }
-      });
+        // Re-apply sort priority: Morning Only First
+        workingStudents.sort((a, b) => (a.isMorningOnly === b.isMorningOnly) ? 0 : a.isMorningOnly ? -1 : 1);
+
+        // Iterate students to find a slot
+        workingStudents.forEach(student => {
+            // Skip if student already has enough assignments
+            if (student.assignedActivityIds.length >= assignmentsPerStudent) return;
+
+            // Iterate priorities (These are Public IDs)
+            for (const wantedPublicId of student.priorities) {
+                // Find all instances of this activity (e.g. Vormittag and Nachmittag versions)
+                const potentialActivities = activities.filter(a => a.publicId === wantedPublicId);
+
+                // Check if already assigned to ANY instance of this public ID
+                const alreadyHasThisPublicId = potentialActivities.some(a => student.assignedActivityIds.includes(a.id));
+                if (alreadyHasThisPublicId) continue;
+
+                // Find a valid instance
+                const validInstances = potentialActivities.filter(activity => {
+                    // Constraint: Morning Only
+                    if (student.isMorningOnly && activity.timeSlot !== 'V') return false;
+                    
+                    // Constraint: Capacity
+                    if (activityCounts[activity.id] >= activity.maxParticipants) return false;
+
+                    return true;
+                });
+
+                if (validInstances.length > 0) {
+                    const chosenActivity = validInstances[0]; // Simple pick first available
+                    student.assignedActivityIds.push(chosenActivity.id);
+                    activityCounts[chosenActivity.id]++;
+                    break; // Move to next student after assignment in this round
+                }
+            }
+        });
     }
 
-    // 6. Merge results
-    // Combine the newly processed students with the untouched inactive students
-    const allStudents = [...inactiveStudents, ...workingStudents];
-    
-    // Sort by Name for display
+    // 7. Merge results: Inactive + Locked Active + Newly Assigned Active
+    const allStudents = [...inactiveStudents, ...lockedActiveStudents, ...workingStudents];
     allStudents.sort((a, b) => a.name.localeCompare(b.name));
     setStudents(allStudents);
   };
@@ -339,9 +466,10 @@ export default function App() {
   // --- Render Helpers ---
   const getStats = () => {
     const total = students.length;
-    const assigned = students.filter(s => s.assignedActivityId !== null).length;
-    const unassigned = total - assigned;
-    return { total, assigned, unassigned };
+    const fullyAssigned = students.filter(s => s.assignedActivityIds.length >= assignmentsPerStudent).length;
+    const partiallyAssigned = students.filter(s => s.assignedActivityIds.length > 0 && s.assignedActivityIds.length < assignmentsPerStudent).length;
+    const unassigned = students.filter(s => s.assignedActivityIds.length === 0).length;
+    return { total, fullyAssigned, partiallyAssigned, unassigned };
   };
 
   // --- LOGIN SCREEN ---
@@ -354,48 +482,28 @@ export default function App() {
               <Lock className="text-blue-600" size={32} />
             </div>
             <h1 className="text-2xl font-bold text-slate-800">SchulAktiv Login</h1>
-            <p className="text-slate-500 mt-2 text-center">Bitte authentifizieren Sie sich, um auf den Schul-Adminbereich zuzugreifen.</p>
+            <p className="text-slate-500 mt-2 text-center">Bitte authentifizieren Sie sich.</p>
           </div>
-          
           <form onSubmit={handleLogin} className="space-y-4">
-            <div>
-              <input 
-                type="password" 
-                value={passwordInput}
-                onChange={(e) => setPasswordInput(e.target.value)}
-                className="w-full border border-slate-300 rounded-lg px-4 py-3 outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all"
-                placeholder="Passwort eingeben..."
-                autoFocus
-              />
-            </div>
-            
-            {loginError && (
-              <div className="text-red-600 text-sm bg-red-50 p-3 rounded-lg text-center font-medium border border-red-100 flex items-center justify-center gap-2">
-                <AlertCircle size={16} />
-                {loginError}
-              </div>
-            )}
-            
-            <button 
-              type="submit"
-              className="w-full bg-slate-900 text-white py-3 rounded-lg font-bold hover:bg-slate-800 transition-colors shadow-lg shadow-slate-200 mt-2"
-            >
-              Anmelden
-            </button>
+            <input 
+              type="password" 
+              value={passwordInput}
+              onChange={(e) => setPasswordInput(e.target.value)}
+              className="w-full border border-slate-300 rounded-lg px-4 py-3 outline-none focus:ring-2 focus:ring-blue-500"
+              placeholder="Passwort eingeben..."
+              autoFocus
+            />
+            {loginError && <div className="text-red-600 text-sm text-center">{loginError}</div>}
+            <button type="submit" className="w-full bg-slate-900 text-white py-3 rounded-lg font-bold hover:bg-slate-800">Anmelden</button>
           </form>
-          
-          <div className="mt-8 text-center text-xs text-slate-400">
-            &copy; {new Date().getFullYear()} SchulAktiv Manager
-          </div>
         </div>
       </div>
     );
   }
 
-  // --- MAIN APP ---
   return (
-    <div className="min-h-screen flex flex-col md:flex-row">
-      {/* Sidebar Navigation */}
+    <div className="min-h-screen flex flex-col md:flex-row font-sans text-slate-900">
+      {/* Sidebar */}
       <aside className="w-full md:w-64 bg-slate-900 text-white flex-shrink-0 flex flex-col no-print">
         <div className="p-6 border-b border-slate-700">
           <h1 className="text-xl font-bold flex items-center gap-2">
@@ -404,36 +512,17 @@ export default function App() {
           </h1>
           <p className="text-xs text-slate-400 mt-1">Verwaltung & Zuteilung</p>
         </div>
-        
         <nav className="flex-1 p-4 space-y-2">
-          <button 
-            onClick={() => setCurrentTab(AppState.SETUP)}
-            className={`w-full flex items-center space-x-3 px-4 py-3 rounded-lg transition-colors ${currentTab === AppState.SETUP ? 'bg-blue-600 text-white' : 'hover:bg-slate-800 text-slate-300'}`}
-          >
-            <Settings size={20} />
-            <span>Setup & Klassen</span>
+          <button onClick={() => setCurrentTab(AppState.SETUP)} className={`w-full flex items-center space-x-3 px-4 py-3 rounded-lg transition-colors ${currentTab === AppState.SETUP ? 'bg-blue-600 text-white' : 'hover:bg-slate-800 text-slate-300'}`}>
+            <Settings size={20} /> <span>Setup & Klassen</span>
           </button>
-
-          <button 
-            onClick={() => setCurrentTab(AppState.IMPORT)}
-            className={`w-full flex items-center space-x-3 px-4 py-3 rounded-lg transition-colors ${currentTab === AppState.IMPORT ? 'bg-blue-600 text-white' : 'hover:bg-slate-800 text-slate-300'}`}
-          >
-            <Users size={20} />
-            <span>SuS Importieren</span>
+          <button onClick={() => setCurrentTab(AppState.IMPORT)} className={`w-full flex items-center space-x-3 px-4 py-3 rounded-lg transition-colors ${currentTab === AppState.IMPORT ? 'bg-blue-600 text-white' : 'hover:bg-slate-800 text-slate-300'}`}>
+            <Users size={20} /> <span>SuS Importieren</span>
           </button>
-
-          <button 
-            onClick={() => setCurrentTab(AppState.ASSIGNMENT)}
-            className={`w-full flex items-center space-x-3 px-4 py-3 rounded-lg transition-colors ${currentTab === AppState.ASSIGNMENT ? 'bg-blue-600 text-white' : 'hover:bg-slate-800 text-slate-300'}`}
-          >
-            <Calendar size={20} />
-            <span>Zuteilung & Export</span>
+          <button onClick={() => setCurrentTab(AppState.ASSIGNMENT)} className={`w-full flex items-center space-x-3 px-4 py-3 rounded-lg transition-colors ${currentTab === AppState.ASSIGNMENT ? 'bg-blue-600 text-white' : 'hover:bg-slate-800 text-slate-300'}`}>
+            <Calendar size={20} /> <span>Zuteilung & Export</span>
           </button>
         </nav>
-
-        <div className="p-4 border-t border-slate-700 text-xs text-slate-500">
-          v1.1.0 (DnD)
-        </div>
       </aside>
 
       {/* Main Content */}
@@ -442,19 +531,34 @@ export default function App() {
         {/* VIEW: SETUP */}
         {currentTab === AppState.SETUP && (
           <div className="space-y-8 max-w-6xl mx-auto animate-fade-in">
-            
             <div className="flex flex-col md:flex-row justify-between items-center bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
                <div>
-                 <h2 className="text-lg font-bold text-slate-800">System-Daten</h2>
-                 <p className="text-sm text-slate-500">Verwalten Sie hier Klassen und Aktivitäten.</p>
+                 <h2 className="text-lg font-bold text-slate-800">System-Einstellungen</h2>
+                 <p className="text-sm text-slate-500">Globale Konfigurationen.</p>
                </div>
-               <button 
-                 onClick={() => generateOverviewPDF(classes, activities)}
-                 className="mt-3 md:mt-0 bg-white border border-slate-300 text-slate-700 px-4 py-2 rounded-lg hover:bg-slate-50 flex items-center gap-2 shadow-sm text-sm font-medium"
-                 title="Druckt eine Übersicht aller Klassen und Aktivitäten für die Lehrpersonen"
-               >
-                 <Printer size={18} className="text-slate-500" /> Referenzlisten drucken
+               <button onClick={() => generateOverviewPDF(classes, activities)} className="mt-3 md:mt-0 bg-white border border-slate-300 text-slate-700 px-4 py-2 rounded-lg hover:bg-slate-50 flex items-center gap-2 shadow-sm text-sm font-medium">
+                 <Printer size={18} className="text-slate-500" /> Referenzlisten
                </button>
+            </div>
+
+            {/* Global Settings */}
+            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                <h3 className="font-bold text-slate-800 mb-4 flex items-center gap-2"><Settings size={18} className="text-blue-600"/> Globale Parameter</h3>
+                <div className="flex items-center gap-4">
+                    <label className="text-sm font-medium text-slate-700">Anzahl Kurse pro Kind:</label>
+                    <div className="flex items-center gap-2">
+                        <input 
+                            type="range" 
+                            min="1" 
+                            max="5" 
+                            value={assignmentsPerStudent} 
+                            onChange={(e) => setAssignmentsPerStudent(parseInt(e.target.value))}
+                            className="w-32 h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer"
+                        />
+                        <span className="bg-blue-100 text-blue-800 font-bold px-3 py-1 rounded-md">{assignmentsPerStudent}</span>
+                    </div>
+                </div>
+                <p className="text-xs text-slate-500 mt-2">Bestimmt, an wie vielen unterschiedlichen Aktivitäten ein Schüler teilnehmen soll.</p>
             </div>
 
             {/* Classes Section */}
@@ -462,114 +566,75 @@ export default function App() {
               <h2 className="text-xl font-bold text-slate-800 mb-4 flex items-center gap-2">
                 <Users className="text-blue-600" /> Klassen verwalten
               </h2>
-              <div className="bg-blue-50 border border-blue-100 p-4 rounded-lg mb-6 text-sm text-blue-800 flex items-start gap-3">
-                 <HelpCircle className="flex-shrink-0 mt-0.5" size={18} />
-                 <div>
-                   <p>Erstellen Sie hier Ihre Schulklassen. Jede Klasse erhält automatisch einen <strong>Buchstaben (A, B, C...)</strong> für die interne Verwaltung.</p>
-                 </div>
-              </div>
-
               <div className="flex gap-4 mb-4">
                 <input 
                   type="text" 
                   value={newClassInput}
                   onChange={(e) => setNewClassInput(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && addClass()}
-                  placeholder="Klassenbezeichnung (z.B. '3. Klasse Meier')"
+                  placeholder="Neue Klasse (z.B. '4. Klasse')"
                   className="flex-1 border border-slate-300 rounded-lg px-4 py-2 focus:ring-2 focus:ring-blue-500 outline-none"
                 />
-                <button 
-                  onClick={addClass}
-                  className="bg-slate-800 text-white px-4 py-2 rounded-lg hover:bg-slate-700 flex items-center gap-2"
-                >
+                <button onClick={addClass} className="bg-slate-800 text-white px-4 py-2 rounded-lg hover:bg-slate-700 flex items-center gap-2">
                   <Plus size={18} /> Hinzufügen
                 </button>
               </div>
-              
-              <div className="space-y-2">
-                {classes.length === 0 && <span className="text-slate-400 text-sm italic">Keine Klassen definiert.</span>}
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                   {classes.map(c => (
-                    <div key={c.id} className="bg-slate-50 border border-slate-200 p-3 rounded-lg flex justify-between items-center group hover:border-blue-300 transition-colors">
+                    <div key={c.id} className="bg-slate-50 border border-slate-200 p-3 rounded-lg flex justify-between items-center group">
                       <div className="flex items-center gap-3">
-                        <span className="bg-blue-600 text-white font-bold w-10 h-10 flex items-center justify-center rounded-lg shadow-sm text-lg">
-                          {c.letter}
-                        </span>
+                        <span className="bg-blue-600 text-white font-bold w-10 h-10 flex items-center justify-center rounded-lg">{c.letter}</span>
                         <div className="flex flex-col">
                           <span className="font-semibold text-slate-700">{c.name}</span>
-                          <span className="text-xs text-slate-400">ID: {c.letter}</span>
                         </div>
                       </div>
-                      <button 
-                        onClick={() => removeClass(c.id)} 
-                        className="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity p-2"
-                        title="Klasse löschen"
-                      >
-                        <Trash2 size={18} />
-                      </button>
+                      <button onClick={() => removeClass(c.id)} className="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity p-2"><Trash2 size={18} /></button>
                     </div>
                   ))}
-                </div>
               </div>
             </section>
 
             {/* Activities Section */}
             <section className="space-y-6">
-              <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-                <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
-                  <Calendar className="text-blue-600" /> Aktivitäten ({activities.length})
-                </h2>
-              </div>
+              <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
+                <Calendar className="text-blue-600" /> Aktivitäten ({activities.length})
+              </h2>
 
-              {/* Manual Add */}
               <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-                <h3 className="font-semibold text-slate-700 mb-4">Neue Aktivität hinzufügen</h3>
+                <h3 className="font-semibold text-slate-700 mb-4">Neue Aktivität</h3>
                 <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
-                  <div className="md:col-span-4">
-                    <input 
-                      placeholder="Name der Aktivität" 
-                      className="w-full border border-slate-300 rounded p-2 text-sm"
-                      value={manualActivity.name}
-                      onChange={e => setManualActivity({...manualActivity, name: e.target.value})}
-                    />
+                  <div className="md:col-span-3">
+                    <input placeholder="Name (Gleicher Name=gleiche ID)" className="w-full border rounded p-2 text-sm" value={manualActivity.name} onChange={e => setManualActivity({...manualActivity, name: e.target.value})} />
                   </div>
                   <div className="md:col-span-3">
-                    <input 
-                      placeholder="Leitung" 
-                      className="w-full border border-slate-300 rounded p-2 text-sm"
-                      value={manualActivity.leader}
-                      onChange={e => setManualActivity({...manualActivity, leader: e.target.value})}
-                    />
+                    <input placeholder="Leitung" className="w-full border rounded p-2 text-sm" value={manualActivity.leader} onChange={e => setManualActivity({...manualActivity, leader: e.target.value})} />
                   </div>
                   <div className="md:col-span-2">
-                    <input 
-                      type="number" 
-                      placeholder="Max SuS" 
-                      className="w-full border border-slate-300 rounded p-2 text-sm"
-                      value={manualActivity.max}
-                      onChange={e => setManualActivity({...manualActivity, max: parseInt(e.target.value) || 0})}
-                    />
+                    <input type="number" placeholder="Max" className="w-full border rounded p-2 text-sm" value={manualActivity.max} onChange={e => setManualActivity({...manualActivity, max: parseInt(e.target.value) || 0})} />
                   </div>
-                   <div className="md:col-span-3">
-                    <button 
-                      onClick={addManualActivity}
-                      className="w-full bg-slate-800 text-white p-2 rounded hover:bg-slate-700 text-sm"
+                   <div className="md:col-span-2">
+                    <input placeholder="Ort (Optional)" className="w-full border rounded p-2 text-sm" value={manualActivity.location} onChange={e => setManualActivity({...manualActivity, location: e.target.value})} />
+                  </div>
+                  <div className="md:col-span-2">
+                    <select 
+                        className="w-full border rounded p-2 text-sm bg-white"
+                        value={manualActivity.timeSlot}
+                        onChange={e => setManualActivity({...manualActivity, timeSlot: e.target.value as TimeSlot})}
                     >
-                      Hinzufügen
-                    </button>
+                        <option value="G">Ganztags (G)</option>
+                        <option value="V">Vormittag (V)</option>
+                        <option value="N">Nachmittag (N)</option>
+                    </select>
                   </div>
-                  <div className="md:col-span-12">
-                     <input 
-                      placeholder="Beschreibung (Optional)" 
-                      className="w-full border border-slate-300 rounded p-2 text-sm"
-                      value={manualActivity.desc}
-                      onChange={e => setManualActivity({...manualActivity, desc: e.target.value})}
-                    />
+                  <div className="md:col-span-10">
+                     <input placeholder="Beschreibung" className="w-full border rounded p-2 text-sm" value={manualActivity.desc} onChange={e => setManualActivity({...manualActivity, desc: e.target.value})} />
+                  </div>
+                  <div className="md:col-span-2">
+                    <button onClick={addManualActivity} className="w-full bg-slate-800 text-white p-2 rounded hover:bg-slate-700 text-sm">Hinzufügen</button>
                   </div>
                 </div>
               </div>
 
-              {/* List */}
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {activities.map(activity => (
                   <ActivityCard key={activity.id} activity={activity} onDelete={deleteActivity} />
@@ -587,119 +652,71 @@ export default function App() {
                 <FileSpreadsheet className="text-blue-600" /> Schülerdaten importieren
               </h2>
 
-              {/* Import Mode Switch */}
               <div className="flex gap-4 mb-6">
-                 <button 
-                   onClick={() => setImportMode('single')}
-                   className={`flex-1 py-3 px-4 rounded-lg border-2 text-sm font-medium transition-all ${importMode === 'single' ? 'border-blue-600 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-500 hover:border-slate-300'}`}
-                 >
-                   1. Einzelne Klasse (Empfohlen)
-                 </button>
-                 <button 
-                   onClick={() => setImportMode('bulk')}
-                   className={`flex-1 py-3 px-4 rounded-lg border-2 text-sm font-medium transition-all ${importMode === 'bulk' ? 'border-blue-600 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-500 hover:border-slate-300'}`}
-                 >
-                   2. Alle (CSV mit Klassenbuchstabe)
-                 </button>
+                 <button onClick={() => setImportMode('single')} className={`flex-1 py-3 px-4 rounded-lg border-2 text-sm font-medium ${importMode === 'single' ? 'border-blue-600 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-500'}`}>1. Einzelne Klasse</button>
+                 <button onClick={() => setImportMode('bulk')} className={`flex-1 py-3 px-4 rounded-lg border-2 text-sm font-medium ${importMode === 'bulk' ? 'border-blue-600 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-500'}`}>2. Alle (CSV)</button>
               </div>
 
-              {importMode === 'single' ? (
-                /* Single Class Mode */
-                <div className="mb-6 space-y-4">
-                    <div>
-                        <label className="block text-sm font-medium text-slate-700 mb-1">Ziel-Klasse auswählen:</label>
-                        <select 
-                            value={selectedClassIdForImport}
-                            onChange={(e) => setSelectedClassIdForImport(e.target.value)}
-                            className="w-full border border-slate-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-blue-500 outline-none bg-white"
-                        >
-                            <option value="">-- Bitte Klasse wählen --</option>
-                            {classes.map(c => (
-                                <option key={c.id} value={c.id}>{c.name} ({c.letter})</option>
-                            ))}
-                        </select>
-                    </div>
-                    <div className="bg-blue-50 p-4 rounded-lg border border-blue-100 text-sm text-blue-800">
-                        <p className="font-bold mb-1">Format:</p>
-                        <code className="bg-white px-2 py-1 rounded border border-blue-200 block mb-2 font-mono text-xs md:text-sm">
-                        Name, Prio1, Prio2, Prio3...
-                        </code>
-                        <p className="text-xs">Beispiel: <code>Marco, 5, 4, 3, 1</code></p>
-                    </div>
-                </div>
-              ) : (
-                /* Bulk Mode */
-                 <div className="mb-6 bg-blue-50 p-4 rounded-lg border border-blue-100 text-sm text-blue-800">
-                    <p className="font-bold mb-1">Format:</p>
-                    <code className="bg-white px-2 py-1 rounded border border-blue-200 block mb-2 font-mono text-xs md:text-sm">
-                    Name, Klassen-Buchstabe, Prio1, Prio2...
-                    </code>
-                    <div className="flex flex-wrap gap-2 mt-2">
-                        {classes.map(c => (
-                        <span key={c.id} className="bg-white border border-blue-200 px-2 py-1 rounded text-xs font-bold">
-                            {c.letter}: {c.name}
-                        </span>
-                        ))}
-                    </div>
+              {importMode === 'single' && (
+                <div className="mb-4">
+                    <select value={selectedClassIdForImport} onChange={(e) => setSelectedClassIdForImport(e.target.value)} className="w-full border border-slate-300 rounded-lg px-3 py-2 outline-none bg-white">
+                        <option value="">-- Klasse wählen --</option>
+                        {classes.map(c => <option key={c.id} value={c.id}>{c.name} ({c.letter})</option>)}
+                    </select>
                 </div>
               )}
+              
+              <div className="bg-blue-50 p-4 rounded-lg border border-blue-100 text-sm text-blue-800 mb-4">
+                  <p className="font-bold mb-1">Format (mit 'X' für nur Vormittag):</p>
+                  <code className="bg-white px-2 py-1 rounded border border-blue-200 block mb-2 font-mono text-xs">
+                    {importMode === 'single' ? "Name, KursNr1, KursNr2..., [X]" : "Name, Klasse(Bst), KursNr1, KursNr2..., [X]"}
+                  </code>
+                  <p className="text-xs">
+                      Verwenden Sie die <strong>Kurs-Nummer (Nr.)</strong>, nicht die UUID. <br/>
+                      Ein 'X' am Ende bedeutet: Kind ist nur am <strong>Vormittag</strong> anwesend. <br/>
+                      Beispiel: <code>Anna, 5, 2, 1, X</code> (Anna will Kurs 5,2,1 und kann nur Vormittags)
+                  </p>
+              </div>
 
               <textarea
-                className="w-full h-64 p-4 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none font-mono text-sm"
-                placeholder={importMode === 'single' ? "Marco, 5, 2, 1\nLisa, 2, 1, 3" : "Marco, A, 5, 2, 1\nTom, B, 5, 3, 1"}
+                className="w-full h-64 p-4 border border-slate-300 rounded-lg font-mono text-sm"
+                placeholder={importMode === 'single' ? "Marco, 5, 2, 1\nAnna, 2, 1, 3, X" : "Marco, A, 5, 2, 1\nAnna, B, 5, 3, 1, X"}
                 value={studentCsvInput}
                 onChange={(e) => setStudentCsvInput(e.target.value)}
               />
 
               <div className="mt-4 flex justify-between items-center">
-                <button 
-                  onClick={clearAllStudents}
-                  className="text-red-400 hover:text-red-600 text-sm flex items-center gap-1"
-                >
-                  <Trash2 size={16} /> Liste leeren
-                </button>
-
-                <button 
-                  onClick={handleImportStudents}
-                  className="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700 font-medium flex items-center gap-2 shadow-sm transition-transform active:scale-95"
-                >
-                  <UserPlus size={20} /> 
-                  SuS zur Liste hinzufügen
-                </button>
+                <button onClick={clearAllStudents} className="text-red-400 hover:text-red-600 text-sm flex items-center gap-1"><Trash2 size={16} /> Liste leeren</button>
+                <button onClick={handleImportStudents} className="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700 font-medium flex items-center gap-2"><UserPlus size={20} /> SuS hinzufügen</button>
               </div>
             </div>
 
             {students.length > 0 && (
               <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-                <h3 className="font-bold text-lg mb-4">Gesamtliste ({students.length} SuS)</h3>
+                <h3 className="font-bold text-lg mb-4">Schülerliste ({students.length})</h3>
                 <div className="overflow-x-auto">
                   <table className="w-full text-left text-sm text-slate-600">
-                    <thead className="bg-slate-50 text-slate-900 font-semibold border-b border-slate-200">
+                    <thead className="bg-slate-50 border-b border-slate-200">
                       <tr>
                         <th className="p-3">Name</th>
                         <th className="p-3">Klasse</th>
-                        <th className="p-3">Wünsche (IDs)</th>
+                        <th className="p-3">Verfügbarkeit</th>
+                        <th className="p-3">Wünsche (Nr.)</th>
                       </tr>
                     </thead>
                     <tbody>
                       {students.slice(-10).reverse().map(s => (
-                        <tr key={s.id} className="border-b border-slate-100 hover:bg-slate-50 animate-fade-in">
+                        <tr key={s.id} className="border-b border-slate-100 hover:bg-slate-50">
                           <td className="p-3">{s.name}</td>
                           <td className="p-3">{s.className}</td>
                           <td className="p-3">
-                            <div className="flex gap-1">
-                              {s.priorities.map((p, idx) => (
-                                <span key={idx} className="bg-slate-200 text-slate-700 px-2 py-0.5 rounded text-xs flex items-center gap-1">
-                                  {p}
-                                </span>
-                              ))}
-                            </div>
+                              {s.isMorningOnly ? <span className="text-xs bg-yellow-100 text-yellow-800 px-2 py-1 rounded font-bold flex w-fit items-center gap-1"><Sun size={12}/> Nur VM</span> : <span className="text-slate-400 text-xs">Immer</span>}
                           </td>
+                          <td className="p-3"><span className="text-xs bg-slate-100 px-2 py-1 rounded">{s.priorities.join(', ')}</span></td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
-                  <p className="text-xs text-slate-400 mt-2 text-center">Zeigt die letzten 10 Importe. Alle Daten gespeichert.</p>
                 </div>
               </div>
             )}
@@ -712,157 +729,145 @@ export default function App() {
              <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-4 mb-6">
                 <div>
                   <h2 className="text-2xl font-bold text-slate-800 flex items-center gap-2">
-                    <CheckCircle2 className="text-green-600" /> Zuteilung & Ergebnis
+                    <CheckCircle2 className="text-green-600" /> Zuteilung
                   </h2>
-                  <p className="text-slate-500 mt-1">Status: {getStats().assigned} von {getStats().total} Schülern zugeteilt.</p>
-                  <p className="text-xs text-blue-500 mt-1 flex items-center gap-1"><GripVertical size={12}/> Drag & Drop aktiviert</p>
+                  <p className="text-slate-500 mt-1">Ziel: {assignmentsPerStudent} Kurse pro Kind.</p>
+                  <div className="flex gap-4 mt-2 text-xs">
+                      <span className="text-green-600 font-bold">{getStats().fullyAssigned} Fertig</span>
+                      <span className="text-orange-500 font-bold">{getStats().partiallyAssigned} Teilweise</span>
+                      <span className="text-red-500 font-bold">{getStats().unassigned} Offen</span>
+                  </div>
                 </div>
-                <div className="flex gap-3">
-                  <button 
-                    onClick={() => generatePDF(activities, students)}
-                    disabled={getStats().assigned === 0}
-                    className="bg-slate-800 text-white px-4 py-2 rounded-lg hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 shadow-sm"
-                  >
-                    <Download size={18} /> PDF Exportieren
-                  </button>
-                </div>
+                <button onClick={() => generatePDF(activities, students, assignmentsPerStudent)} className="bg-slate-800 text-white px-4 py-2 rounded-lg hover:bg-slate-700 flex items-center gap-2">
+                  <Download size={18} /> Exportieren
+                </button>
              </div>
 
-            {/* CONFIGURATION SECTION */}
             <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
                  <div className="flex items-center gap-2 mb-3 pb-2 border-b border-slate-100">
                     <Filter size={18} className="text-blue-600" />
                     <h3 className="font-bold text-slate-800">Misch-Konfiguration</h3>
                  </div>
-                 <p className="text-sm text-slate-500 mb-4">
-                    Wählen Sie, welche Klassen bei diesem Durchlauf gemischt und zugeteilt werden sollen.
-                    <br/>
-                    <span className="text-xs text-slate-400">Hinweis: Bereits zugeteilte Schüler in <strong>nicht</strong> ausgewählten Klassen belegen weiterhin ihre Plätze.</span>
-                 </p>
-                 
                  <div className="flex flex-wrap gap-3 mb-4">
-                    {classes.map(c => {
-                        const isActive = activeClassLetters.includes(c.letter);
-                        return (
-                            <button
-                                key={c.id}
-                                onClick={() => {
-                                    if (isActive) {
-                                        setActiveClassLetters(prev => prev.filter(l => l !== c.letter));
-                                    } else {
-                                        setActiveClassLetters(prev => [...prev, c.letter]);
-                                    }
-                                }}
-                                className={`px-3 py-2 rounded-lg border text-sm font-medium flex items-center gap-2 transition-colors ${isActive ? 'bg-blue-600 border-blue-600 text-white' : 'bg-white border-slate-200 text-slate-600 hover:border-blue-300'}`}
-                            >
-                                {isActive && <CheckCircle2 size={14} />}
-                                {c.name}
-                            </button>
-                        );
-                    })}
-                    {classes.length === 0 && <span className="text-sm text-slate-400 italic">Keine Klassen vorhanden.</span>}
+                    {classes.map(c => (
+                        <button
+                            key={c.id}
+                            onClick={() => setActiveClassLetters(prev => prev.includes(c.letter) ? prev.filter(l => l !== c.letter) : [...prev, c.letter])}
+                            className={`px-3 py-2 rounded-lg border text-sm font-medium flex items-center gap-2 ${activeClassLetters.includes(c.letter) ? 'bg-blue-600 border-blue-600 text-white' : 'bg-white border-slate-200'}`}
+                        >
+                            {activeClassLetters.includes(c.letter) && <CheckCircle2 size={14} />} {c.name}
+                        </button>
+                    ))}
                  </div>
-
-                  <button 
-                    onClick={runAllocation}
-                    className="w-full md:w-auto bg-green-600 text-white px-6 py-3 rounded-lg hover:bg-green-700 flex items-center justify-center gap-2 shadow-sm transition-all font-bold"
-                  >
-                    <RefreshCw size={18} /> 
-                    Algorithmus für Auswahl starten
-                  </button>
+                  <div className="flex items-center gap-4">
+                      <button onClick={runAllocation} className="bg-green-600 text-white px-6 py-3 rounded-lg hover:bg-green-700 flex items-center justify-center gap-2 font-bold shadow-sm transition-transform active:scale-95">
+                        <RefreshCw size={18} /> Zuteilung starten
+                      </button>
+                      <p className="text-xs text-slate-500 max-w-sm">
+                          Startet die Verteilung für die gewählten Klassen. Schüler mit dem <Lock size={10} className="inline"/> Symbol werden <strong>nicht</strong> verändert.
+                      </p>
+                  </div>
             </div>
 
-
-            {/* Unassigned Students Drop Zone */}
+             {/* Unassigned Drop Zone */}
              <div 
                onDragOver={handleDragOver}
-               onDrop={(e) => handleDrop(e, null)}
+               onDrop={handleDropOnUnassigned}
                className={`border-2 border-dashed rounded-lg p-4 transition-colors ${draggedStudentId ? 'border-red-300 bg-red-50' : 'border-slate-200 bg-slate-50'}`}
              >
-               <div className="flex items-start gap-3 mb-2">
-                 <AlertCircle className="text-red-500 mt-0.5" />
-                 <div>
-                   <h4 className="font-bold text-red-800">Nicht zugeteilt ({getStats().unassigned})</h4>
-                   <p className="text-xs text-red-600">Ziehen Sie Schüler hierher, um sie aus einer Gruppe zu entfernen, oder ziehen Sie sie von hier in eine Gruppe.</p>
-                 </div>
-               </div>
+               <h4 className="font-bold text-red-800 flex items-center gap-2"><AlertCircle size={16}/> Nicht / Teilweise Zugeteilt</h4>
+               <p className="text-xs text-red-600 mb-3">Schüler hierhin ziehen, um <strong>alle</strong> Zuteilungen zu löschen.</p>
                
-               {getStats().unassigned > 0 ? (
-                 <div className="flex flex-wrap gap-2 mt-2">
-                   {students.filter(s => s.assignedActivityId === null).map(s => (
-                     <div 
+               <div className="flex flex-wrap gap-2">
+                 {students.filter(s => s.assignedActivityIds.length < assignmentsPerStudent).map(s => (
+                   <div 
                        key={s.id}
                        draggable
                        onDragStart={(e) => handleDragStart(e, s.id)}
-                       className="bg-white border border-red-200 text-red-800 px-2 py-1 rounded text-sm shadow-sm cursor-move hover:bg-red-50 flex items-center gap-2 active:opacity-50"
-                     >
-                       <GripVertical size={14} className="text-red-300" />
-                       <span>{s.name}</span>
-                       <span className="text-xs text-red-400">({s.className})</span>
-                     </div>
-                   ))}
-                 </div>
-               ) : (
-                 <p className="text-xs text-slate-400 italic mt-2">Alle Schüler sind zugeteilt.</p>
-               )}
+                       className={`border px-2 py-1 rounded text-sm shadow-sm flex items-center gap-2 cursor-move ${s.isLocked ? 'bg-slate-100 text-slate-500 border-slate-200' : 'bg-white border-red-200 text-red-800 hover:bg-red-50'}`}
+                   >
+                       <GripVertical size={14} className="text-slate-300" />
+                       <span className={s.isLocked ? "line-through decoration-slate-400" : ""}>{s.name} ({s.assignedActivityIds.length}/{assignmentsPerStudent})</span>
+                       {s.isMorningOnly && <Sun size={12} className="text-yellow-600"/>}
+                       <button onClick={(e) => { e.preventDefault(); e.stopPropagation(); toggleStudentLock(s.id); }} className="hover:bg-slate-200 rounded p-0.5">
+                           {s.isLocked ? <Lock size={12} className="text-slate-600"/> : <Unlock size={12} className="text-slate-300"/>}
+                       </button>
+                   </div>
+                 ))}
+                 {students.every(s => s.assignedActivityIds.length >= assignmentsPerStudent) && <span className="text-xs text-slate-400">Alle Schüler vollständig verteilt.</span>}
+               </div>
              </div>
 
-             {/* Activity Grid - Drop Zones */}
+             {/* Activity Grid */}
              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 {activities.map(activity => {
-                  const assignedHere = students.filter(s => s.assignedActivityId === activity.id);
+                  const assignedHere = students.filter(s => s.assignedActivityIds.includes(activity.id));
                   const isFull = assignedHere.length >= activity.maxParticipants;
                   
                   return (
                     <div 
                         key={activity.id} 
                         onDragOver={handleDragOver}
-                        onDrop={(e) => handleDrop(e, activity.id)}
-                        className={`bg-white rounded-xl border shadow-sm flex flex-col transition-all ${draggedStudentId ? 'ring-2 ring-offset-2 ring-blue-100 cursor-copy' : ''} ${isFull ? 'border-orange-200' : 'border-slate-200'}`}
+                        onDrop={(e) => handleDropOnActivity(e, activity.id)}
+                        className={`bg-white rounded-xl border shadow-sm flex flex-col ${draggedStudentId ? 'ring-2 ring-blue-100 cursor-copy' : ''} ${isFull ? 'border-orange-200' : 'border-slate-200'}`}
                     >
                       <div className={`p-4 border-b ${isFull ? 'bg-orange-50 border-orange-100' : 'bg-slate-50 border-slate-100'} rounded-t-xl flex justify-between items-center`}>
                         <div>
-                          <h3 className="font-bold text-slate-800">{activity.name}</h3>
-                          <p className="text-xs text-slate-500">Ltg: {activity.leader}</p>
+                          <div className="flex items-center gap-2">
+                              <span className="bg-slate-800 text-white text-xs px-2 py-0.5 rounded font-mono">Nr.{activity.publicId}</span>
+                              <h3 className="font-bold text-slate-800">{activity.name}</h3>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2 mt-1">
+                             <span className={`text-xs px-1.5 rounded border font-bold ${activity.timeSlot === 'G' ? 'bg-purple-100 text-purple-700 border-purple-200' : activity.timeSlot === 'V' ? 'bg-yellow-100 text-yellow-700 border-yellow-200' : 'bg-indigo-100 text-indigo-700 border-indigo-200'}`}>
+                                  {activity.timeSlot === 'G' ? 'Ganztags' : activity.timeSlot === 'V' ? 'Vormittag' : 'Nachmittag'}
+                              </span>
+                             <span className="text-xs text-slate-500">{activity.leader}</span>
+                             {activity.location && <span className="text-xs text-slate-400 flex items-center"><MapPin size={10} className="mr-0.5"/> {activity.location}</span>}
+                          </div>
                         </div>
-                        <div className="text-right">
-                           <span className={`text-sm font-bold ${isFull ? 'text-orange-600' : 'text-green-600'}`}>
+                        <span className={`text-sm font-bold ${isFull ? 'text-orange-600' : 'text-green-600'}`}>
                              {assignedHere.length} / {activity.maxParticipants}
-                           </span>
-                        </div>
+                        </span>
                       </div>
                       <div className="p-0 max-h-64 overflow-y-auto">
-                        {assignedHere.length === 0 ? (
-                          <div className="p-8 text-center text-slate-400 text-sm italic">
-                            Leer - Ziehen Sie Schüler hierher
-                          </div>
-                        ) : (
                           <table className="w-full text-sm text-left">
                             <thead className="bg-slate-50 sticky top-0">
                               <tr>
-                                <th className="p-2 pl-4 font-medium text-slate-500 w-8"></th>
+                                <th className="p-2 pl-4 w-8"></th>
                                 <th className="p-2 font-medium text-slate-500">Name</th>
-                                <th className="p-2 font-medium text-slate-500">Klasse</th>
+                                <th className="p-2 text-right w-16"></th>
                               </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-100">
                               {assignedHere.map(s => (
                                 <tr 
-                                  key={s.id}
-                                  draggable
-                                  onDragStart={(e) => handleDragStart(e, s.id)}
-                                  className="hover:bg-blue-50 cursor-move transition-colors active:opacity-50 group"
+                                    key={s.id} 
+                                    className={`hover:bg-blue-50 group cursor-grab ${s.isLocked ? 'bg-slate-50' : ''}`}
+                                    draggable={true} // Enabled dragging
+                                    onDragStart={(e) => handleDragStart(e, s.id)}
                                 >
-                                  <td className="p-2 pl-4 text-slate-300 group-hover:text-blue-400">
-                                    <GripVertical size={14} />
+                                  <td className="p-2 pl-4 text-slate-300"><GripVertical size={14} /></td>
+                                  <td className="p-2 text-slate-700 font-medium flex items-center gap-2">
+                                      {s.name}
+                                      {s.isMorningOnly && (
+                                        <span title="Nur Vormittag" className="flex items-center">
+                                          <Sun size={12} className="text-yellow-500" />
+                                        </span>
+                                      )}
+                                      {s.isLocked && <Lock size={12} className="text-slate-400" />}
                                   </td>
-                                  <td className="p-2 text-slate-700 font-medium">{s.name}</td>
-                                  <td className="p-2 text-slate-500 text-xs">{s.className}</td>
+                                  <td className="p-2 text-right flex items-center justify-end gap-1">
+                                      <button onClick={() => toggleStudentLock(s.id)} className="text-slate-300 hover:text-blue-500 p-1">
+                                          {s.isLocked ? <Lock size={14} className="text-blue-500"/> : <Unlock size={14}/>}
+                                      </button>
+                                      {!s.isLocked && (
+                                        <button onClick={() => removeAssignment(s.id, activity.id)} className="text-slate-300 hover:text-red-500 p-1"><Trash2 size={14}/></button>
+                                      )}
+                                  </td>
                                 </tr>
                               ))}
                             </tbody>
                           </table>
-                        )}
                       </div>
                     </div>
                   );

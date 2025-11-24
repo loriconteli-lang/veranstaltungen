@@ -1,23 +1,37 @@
+
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { Activity, Student, ClassGroup } from '../types';
 
-export const generatePDF = (activities: Activity[], students: Student[]) => {
+export const generatePDF = (activities: Activity[], students: Student[], assignmentsPerStudent: number) => {
   const doc = new jsPDF();
   const date = new Date().toLocaleDateString('de-DE');
 
   doc.setFontSize(18);
   doc.text(`Zuteilung Aktivitäten - ${date}`, 14, 20);
+  doc.setFontSize(10);
+  doc.text(`Ziel: ${assignmentsPerStudent} Kurse pro Kind`, 14, 26);
 
-  // Get all assignments
-  const assignedStudents = students.filter(s => s.assignedActivityId !== null);
-  const unassignedStudents = students.filter(s => s.assignedActivityId === null);
+  // Helper to get time label
+  const getTimeLabel = (slot: string) => {
+    if (slot === 'G') return 'Ganztags';
+    if (slot === 'V') return 'Vormittag';
+    if (slot === 'N') return 'Nachmittag';
+    return slot;
+  };
 
   // Iterate through activities and create a table for each
-  let yPos = 30;
+  // Sort by Public ID then TimeSlot
+  const sortedActivities = [...activities].sort((a,b) => {
+    if (a.publicId !== b.publicId) return a.publicId - b.publicId;
+    return a.timeSlot.localeCompare(b.timeSlot);
+  });
 
-  activities.forEach((activity) => {
-    const participants = assignedStudents.filter(s => s.assignedActivityId === activity.id);
+  let yPos = 35;
+
+  sortedActivities.forEach((activity) => {
+    // Check if student has this activity UUID in their list
+    const participants = students.filter(s => s.assignedActivityIds.includes(activity.id));
     
     // Add a page break if we are too low on the page
     if (yPos > 250) {
@@ -27,16 +41,27 @@ export const generatePDF = (activities: Activity[], students: Student[]) => {
 
     doc.setFontSize(14);
     doc.setTextColor(40, 40, 40);
-    doc.text(`${activity.id}. ${activity.name} (${participants.length}/${activity.maxParticipants})`, 14, yPos);
+    // Title with Public ID and Name
+    doc.text(`${activity.publicId}. ${activity.name}`, 14, yPos);
+    
     doc.setFontSize(10);
     doc.setTextColor(100, 100, 100);
-    doc.text(`Leitung: ${activity.leader}`, 14, yPos + 6);
+    
+    let infoText = `Zeit: ${getTimeLabel(activity.timeSlot)} | Leitung: ${activity.leader}`;
+    if (activity.location) infoText += ` | Ort: ${activity.location}`;
+    infoText += ` | Auslastung: ${participants.length}/${activity.maxParticipants}`;
 
-    const tableData = participants.map(p => [p.name, p.className]);
+    doc.text(infoText, 14, yPos + 5);
+
+    const tableData = participants.map(p => [
+        p.name, 
+        p.className, 
+        p.isMorningOnly ? '(Nur Vormittag)' : ''
+    ]);
 
     autoTable(doc, {
-      startY: yPos + 10,
-      head: [['Name', 'Klasse']],
+      startY: yPos + 8,
+      head: [['Name', 'Klasse', 'Info']],
       body: tableData,
       theme: 'grid',
       headStyles: { fillColor: [59, 130, 246] }, // Tailwind blue-500
@@ -45,25 +70,33 @@ export const generatePDF = (activities: Activity[], students: Student[]) => {
     });
 
     // Update Y position based on the table height
-    // @ts-ignore - lastAutoTable exists on the doc object extended by autotable plugin
-    yPos = doc.lastAutoTable.finalY + 20;
+    // @ts-ignore
+    yPos = doc.lastAutoTable.finalY + 15;
   });
 
-  // Unassigned Students Section
-  if (unassignedStudents.length > 0) {
+  // Unassigned or Partially Assigned Students Section
+  const incompleteStudents = students.filter(s => s.assignedActivityIds.length < assignmentsPerStudent);
+
+  if (incompleteStudents.length > 0) {
     if (yPos > 240) {
         doc.addPage();
         yPos = 20;
     }
     doc.setFontSize(14);
     doc.setTextColor(220, 38, 38); // Red
-    doc.text(`Nicht zugeteilt (${unassignedStudents.length})`, 14, yPos);
+    doc.text(`Nicht vollständig zugeteilt (Soll: ${assignmentsPerStudent})`, 14, yPos);
     
-    const tableData = unassignedStudents.map(p => [p.name, p.className, p.priorities.join(', ')]);
+    const tableData = incompleteStudents.map(p => [
+        p.name, 
+        p.className, 
+        `${p.assignedActivityIds.length} / ${assignmentsPerStudent}`,
+        p.isMorningOnly ? 'Nur Vormittag' : '-',
+        p.priorities.join(', ')
+    ]);
 
     autoTable(doc, {
         startY: yPos + 10,
-        head: [['Name', 'Klasse', 'Wünsche (IDs)']],
+        head: [['Name', 'Klasse', 'Status', 'Verfügbarkeit', 'Wünsche (Kurs Nr.)']],
         body: tableData,
         theme: 'grid',
         headStyles: { fillColor: [220, 38, 38] },
@@ -125,22 +158,30 @@ export const generateOverviewPDF = (classes: ClassGroup[], activities: Activity[
   doc.text('2. Aktivitäten-Übersicht', 14, finalY);
   
   const activityData = activities
-    .sort((a, b) => a.id - b.id)
-    .map(a => [a.id, a.name, a.leader, a.maxParticipants, a.description || '-']);
+    .sort((a, b) => a.publicId - b.publicId)
+    .map(a => [
+        a.publicId, 
+        a.name, 
+        a.timeSlot === 'G' ? 'Ganztags' : (a.timeSlot === 'V' ? 'Vormittag' : 'Nachmittag'),
+        a.leader, 
+        a.location || '-',
+        a.maxParticipants, 
+    ]);
 
   autoTable(doc, {
     startY: finalY + 10,
-    head: [['ID', 'Aktivität', 'Leitung', 'Max', 'Info']],
+    head: [['Nr.', 'Aktivität', 'Zeit', 'Leitung', 'Ort', 'Max']],
     body: activityData,
     theme: 'grid',
     headStyles: { fillColor: [15, 23, 42], textColor: 255, fontStyle: 'bold' },
     styles: { fontSize: 10, cellPadding: 3 },
     columnStyles: {
-      0: { cellWidth: 15, fontStyle: 'bold' }, // ID
-      1: { cellWidth: 60 }, // Name
-      2: { cellWidth: 40 }, // Leader
-      3: { cellWidth: 15, halign: 'center' }, // Max
-      4: { cellWidth: 'auto' } // Info
+      0: { cellWidth: 15, fontStyle: 'bold', halign: 'center' }, // Nr
+      1: { cellWidth: 40 }, // Name
+      2: { cellWidth: 25 }, // Zeit
+      3: { cellWidth: 35 }, // Leader
+      4: { cellWidth: 35 }, // Location
+      5: { cellWidth: 15, halign: 'center' }, // Max
     },
     margin: { left: 14 },
   });
